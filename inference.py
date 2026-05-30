@@ -17,6 +17,71 @@ import contextlib
 import io
 import logging
 import time
+from pathlib import Path
+
+
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def iter_input_images(input_path: str):
+    path = Path(input_path)
+    if path.is_file():
+        if path.suffix.lower() not in IMAGE_SUFFIXES:
+            raise ValueError(f"Unsupported input image type: {path}")
+        yield path
+        return
+    if path.is_dir():
+        for candidate in sorted(path.iterdir()):
+            if candidate.is_file() and candidate.suffix.lower() in IMAGE_SUFFIXES:
+                yield candidate
+        return
+    raise FileNotFoundError(f"Input image path does not exist: {path}")
+
+
+def prepare_auto_segmented_inputs(opt, test_image_dir: str):
+    if not opt.input_image:
+        raise ValueError("--input_image is required when --auto_segment is set")
+
+    from scenegen.segmentation import AutoSegmentationConfig, AutoSegmenter, save_scene_input
+
+    config = AutoSegmentationConfig(
+        sam2_checkpoint=opt.sam2_checkpoint,
+        sam2_model_cfg=opt.sam2_model_cfg,
+        device=opt.sam2_device,
+        points_per_side=opt.sam2_points_per_side,
+        points_per_batch=opt.sam2_points_per_batch,
+        pred_iou_thresh=opt.sam2_pred_iou_thresh,
+        stability_score_thresh=opt.sam2_stability_score_thresh,
+        min_mask_region_area=opt.sam2_min_mask_region_area,
+        min_area_ratio=opt.auto_min_area_ratio,
+        max_area_ratio=opt.auto_max_area_ratio,
+        min_new_area_ratio=opt.auto_min_new_area_ratio,
+        max_instances=opt.auto_max_instances,
+        sort_by=opt.auto_sort_by,
+    )
+    segmenter = AutoSegmenter.from_sam2(config)
+    os.makedirs(test_image_dir, exist_ok=True)
+
+    prepared_count = 0
+    for image_path in iter_input_images(opt.input_image):
+        scene_id = image_path.stem
+        scene_dir = Path(test_image_dir) / scene_id
+        existing_masks = list(scene_dir.glob("*_mask.png"))
+        if existing_masks and not opt.auto_segment_overwrite:
+            print(f"Auto segmentation skipped for {scene_id}: masks already exist")
+            continue
+
+        print(f"Auto segmenting {image_path} -> {scene_dir}")
+        result = segmenter.segment(image_path)
+        if len(result.instances) == 0:
+            print(f"Auto segmentation found no instances for {image_path}, skipping")
+            continue
+        save_scene_input(result, scene_dir, overwrite=opt.auto_segment_overwrite)
+        print(f"Prepared {len(result.instances)} instance masks for {scene_id}")
+        prepared_count += 1
+
+    if prepared_count == 0:
+        print("Auto segmentation did not prepare any new scenes")
 
 if __name__ == "__main__":
 
@@ -27,10 +92,28 @@ if __name__ == "__main__":
     parser.add_argument('--gpu_num', type=int, default=0, help='GPU number to use for evaluation')
     parser.add_argument('--gpu_id', type=int, default=0, help='GPU ID to use for evaluation')
     parser.add_argument('--gradio', action='store_true', help='Run Gradio interface webpage for visualization')
+    parser.add_argument('--auto_segment', action='store_true', help='Automatically create masks from --input_image before inference')
+    parser.add_argument('--input_image', type=str, default=None, help='Single image or image directory to auto-segment')
+    parser.add_argument('--auto_segment_overwrite', action='store_true', help='Overwrite existing auto-segmented scene inputs')
+    parser.add_argument('--auto_max_instances', type=int, default=16, help='Maximum automatic masks to keep per scene')
+    parser.add_argument('--auto_min_area_ratio', type=float, default=0.002, help='Minimum mask area as a fraction of image area')
+    parser.add_argument('--auto_max_area_ratio', type=float, default=0.85, help='Maximum mask area as a fraction of image area')
+    parser.add_argument('--auto_min_new_area_ratio', type=float, default=0.35, help='Minimum unclaimed area ratio after resolving overlapping masks')
+    parser.add_argument('--auto_sort_by', type=str, default='score', choices=['score', 'area'], help='Automatic mask ordering before overlap filtering')
+    parser.add_argument('--sam2_checkpoint', type=str, default='./checkpoints/sam2-hiera-large/sam2_hiera_large.pt', help='SAM2 checkpoint for automatic segmentation')
+    parser.add_argument('--sam2_model_cfg', type=str, default='configs/sam2/sam2_hiera_l.yaml', help='SAM2 model config for automatic segmentation')
+    parser.add_argument('--sam2_device', type=str, default='cuda', help='Device used for SAM2 automatic segmentation')
+    parser.add_argument('--sam2_points_per_side', type=int, default=32, help='SAM2 automatic mask points per side')
+    parser.add_argument('--sam2_points_per_batch', type=int, default=64, help='SAM2 automatic mask points per batch')
+    parser.add_argument('--sam2_pred_iou_thresh', type=float, default=0.8, help='SAM2 automatic mask predicted IoU threshold')
+    parser.add_argument('--sam2_stability_score_thresh', type=float, default=0.95, help='SAM2 automatic mask stability threshold')
+    parser.add_argument('--sam2_min_mask_region_area', type=int, default=100, help='SAM2 postprocessing threshold for small mask regions')
     opt = parser.parse_args(sys.argv[1:])
     opt = edict(vars(opt))
 
     test_image_dir = os.path.join(opt.output_dir, f'masked_images_{opt.set}')
+    if opt.auto_segment:
+        prepare_auto_segmented_inputs(opt, test_image_dir)
     assert os.path.exists(test_image_dir), f"Test image directory {test_image_dir} does not exist"
 
     scene_output_dir = os.path.join(opt.output_dir, f'scene_{opt.set}_{opt.model_name}')
