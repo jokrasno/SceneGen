@@ -1,3 +1,5 @@
 checkpoints/
 tmp/
 __pycache__/
+incoming_photos/
+test_runs/

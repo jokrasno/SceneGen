@@ -103,6 +103,26 @@ This script processes a directory of pre-segmented images.
   python inference.py --gradio
   ```
 
+### Automatic Single-Image Segmentation
+For raw scene photos, `inference.py` can create instance masks first and then run the existing SceneGen generation path. This uses SAM2 automatic mask generation to write a standard `masked_images_<set>/<scene_id>` folder with one `N.png` / `N_mask.png` pair per detected instance.
+
+```sh
+python inference.py \
+  --auto_segment \
+  --input_image /path/to/scene.jpg \
+  --output_dir outputs/my_scene \
+  --set test \
+  --model_name SceneGen
+```
+
+The exported GLB will be written to:
+
+```sh
+outputs/my_scene/scene_test_SceneGen/<scene_id>.glb
+```
+
+Automatic segmentation requires SAM2 to be installed and a SAM2 checkpoint to exist at `checkpoints/sam2-hiera-large/sam2_hiera_large.pt`, or pass `--sam2_checkpoint` and `--sam2_model_cfg` explicitly. The generated label map and manifest are saved under each scene's `_auto_segmentation/` debug folder so the batch loader only sees the normal SceneGen files.
+
 ## 📚 Dataset
 To train and evaluate SceneGen, we use the [3D-FUTURE](https://tianchi.aliyun.com/dataset/98063) dataset. Please download and preprocess the dataset as follows:
 1. Download the 3D-FUTURE dataset from [here](https://tianchi.aliyun.com/dataset/98063) which requires applying for access.
