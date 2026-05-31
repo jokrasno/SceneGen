@@ -23,6 +23,15 @@ from pathlib import Path
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
 
+def parse_auto_labels(value: str | None):
+    from scenegen.segmentation import DEFAULT_AUTO_LABELS
+
+    if not value:
+        return DEFAULT_AUTO_LABELS
+    labels = tuple(label.strip() for label in value.split(",") if label.strip())
+    return labels or DEFAULT_AUTO_LABELS
+
+
 def iter_input_images(input_path: str):
     path = Path(input_path)
     if path.is_file():
@@ -42,12 +51,16 @@ def prepare_auto_segmented_inputs(opt, test_image_dir: str):
     if not opt.input_image:
         raise ValueError("--input_image is required when --auto_segment is set")
 
-    from scenegen.segmentation import AutoSegmentationConfig, AutoSegmenter, save_scene_input
+    from scenegen.segmentation import AutoSegmentationConfig, load_boxes_json, save_scene_input, segment_image
 
     config = AutoSegmentationConfig(
         sam2_checkpoint=opt.sam2_checkpoint,
         sam2_model_cfg=opt.sam2_model_cfg,
         device=opt.sam2_device,
+        segmentation_mode=opt.segmentation_mode,
+        image_preprocess=opt.image_preprocess,
+        segment_max_side=opt.segment_max_side,
+        portrait_crop_ratio=opt.portrait_crop_ratio,
         points_per_side=opt.sam2_points_per_side,
         points_per_batch=opt.sam2_points_per_batch,
         pred_iou_thresh=opt.sam2_pred_iou_thresh,
@@ -58,30 +71,62 @@ def prepare_auto_segmented_inputs(opt, test_image_dir: str):
         min_new_area_ratio=opt.auto_min_new_area_ratio,
         max_instances=opt.auto_max_instances,
         sort_by=opt.auto_sort_by,
+        detector_id=opt.detector_id,
+        detection_threshold=opt.detection_threshold,
+        auto_labels=parse_auto_labels(opt.auto_labels),
+        exclude_people=not opt.include_people,
+        include_room_surfaces=opt.include_room_surfaces,
+        allow_low_quality_masks=opt.allow_low_quality_masks,
+        plane_area_ratio=opt.plane_area_ratio,
+        edge_touch_ratio=opt.edge_touch_ratio,
     )
-    segmenter = AutoSegmenter.from_sam2(config)
+    boxes_by_scene = load_boxes_json(opt.boxes_json) if opt.boxes_json else {}
     os.makedirs(test_image_dir, exist_ok=True)
 
     prepared_count = 0
+    allowed_scene_ids = set()
     for image_path in iter_input_images(opt.input_image):
         scene_id = image_path.stem
         scene_dir = Path(test_image_dir) / scene_id
         existing_masks = list(scene_dir.glob("*_mask.png"))
         if existing_masks and not opt.auto_segment_overwrite:
             print(f"Auto segmentation skipped for {scene_id}: masks already exist")
+            allowed_scene_ids.add(scene_id)
             continue
 
         print(f"Auto segmenting {image_path} -> {scene_dir}")
-        result = segmenter.segment(image_path)
-        if len(result.instances) == 0:
-            print(f"Auto segmentation found no instances for {image_path}, skipping")
+        boxes = boxes_by_scene.get(scene_id) or boxes_by_scene.get(None)
+        if opt.segmentation_mode == "manual_boxes" and boxes is None:
+            print(f"Manual box segmentation skipped for {scene_id}: no boxes found in --boxes_json")
             continue
-        save_scene_input(result, scene_dir, overwrite=opt.auto_segment_overwrite)
-        print(f"Prepared {len(result.instances)} instance masks for {scene_id}")
+
+        result = segment_image(image_path, config=config, boxes=boxes)
+        if len(result.instances) == 0:
+            print(f"Auto segmentation found no usable instances for {image_path}; saving debug report only")
+            save_scene_input(result, scene_dir, overwrite=opt.auto_segment_overwrite, write_batch_files=False)
+            continue
+
+        write_batch_files = result.quality_passed or opt.allow_low_quality_masks
+        save_scene_input(
+            result,
+            scene_dir,
+            overwrite=opt.auto_segment_overwrite,
+            write_batch_files=write_batch_files,
+        )
+        if not write_batch_files:
+            print(f"Segmentation quality failed for {scene_id}; saved debug report only")
+            continue
+
+        print(
+            f"Prepared {len(result.instances)} instance masks for {scene_id} "
+            f"using {result.mode}; quality_passed={result.quality_passed}"
+        )
         prepared_count += 1
+        allowed_scene_ids.add(scene_id)
 
     if prepared_count == 0:
         print("Auto segmentation did not prepare any new scenes")
+    return allowed_scene_ids
 
 if __name__ == "__main__":
 
@@ -95,11 +140,25 @@ if __name__ == "__main__":
     parser.add_argument('--auto_segment', action='store_true', help='Automatically create masks from --input_image before inference')
     parser.add_argument('--input_image', type=str, default=None, help='Single image or image directory to auto-segment')
     parser.add_argument('--auto_segment_overwrite', action='store_true', help='Overwrite existing auto-segmented scene inputs')
+    parser.add_argument('--segmentation_mode', type=str, default='hybrid', choices=['hybrid', 'manual_boxes', 'sam2_auto'], help='Segmentation strategy used by --auto_segment')
+    parser.add_argument('--boxes_json', type=str, default=None, help='Manual boxes JSON for --segmentation_mode manual_boxes')
+    parser.add_argument('--auto_labels', type=str, default=None, help='Comma-separated zero-shot detector labels for hybrid segmentation')
+    parser.add_argument('--detector_id', type=str, default='IDEA-Research/grounding-dino-tiny', help='Transformers zero-shot detector model for hybrid segmentation')
+    parser.add_argument('--detection_threshold', type=float, default=0.25, help='Zero-shot detection threshold for hybrid segmentation')
+    parser.add_argument('--include_people', action='store_true', help='Keep person detections instead of filtering them by default')
+    parser.add_argument('--include_room_surfaces', action='store_true', help='Keep wall/floor/ceiling-style masks instead of filtering them by default')
+    parser.add_argument('--allow_low_quality_masks', action='store_true', help='Write batch masks even when quality gates warn about low-quality masks')
+    parser.add_argument('--segment_only', action='store_true', help='Only create segmentation inputs and debug reports; do not run SceneGen')
+    parser.add_argument('--image_preprocess', type=str, default='auto', choices=['auto', 'none'], help='Normalize raw photos before segmentation')
+    parser.add_argument('--segment_max_side', type=int, default=2048, help='Maximum image side used for segmentation preprocessing')
+    parser.add_argument('--portrait_crop_ratio', type=float, default=1.2, help='Auto-crop portrait images at or above this height/width ratio')
     parser.add_argument('--auto_max_instances', type=int, default=16, help='Maximum automatic masks to keep per scene')
     parser.add_argument('--auto_min_area_ratio', type=float, default=0.002, help='Minimum mask area as a fraction of image area')
     parser.add_argument('--auto_max_area_ratio', type=float, default=0.85, help='Maximum mask area as a fraction of image area')
     parser.add_argument('--auto_min_new_area_ratio', type=float, default=0.35, help='Minimum unclaimed area ratio after resolving overlapping masks')
     parser.add_argument('--auto_sort_by', type=str, default='score', choices=['score', 'area'], help='Automatic mask ordering before overlap filtering')
+    parser.add_argument('--plane_area_ratio', type=float, default=0.45, help='Reject unlabeled plane-like masks above this image area ratio')
+    parser.add_argument('--edge_touch_ratio', type=float, default=0.55, help='Reject large masks touching this fraction of image edges')
     parser.add_argument('--sam2_checkpoint', type=str, default='./checkpoints/sam2-hiera-large/sam2_hiera_large.pt', help='SAM2 checkpoint for automatic segmentation')
     parser.add_argument('--sam2_model_cfg', type=str, default='configs/sam2/sam2_hiera_l.yaml', help='SAM2 model config for automatic segmentation')
     parser.add_argument('--sam2_device', type=str, default='cuda', help='Device used for SAM2 automatic segmentation')
@@ -112,8 +171,11 @@ if __name__ == "__main__":
     opt = edict(vars(opt))
 
     test_image_dir = os.path.join(opt.output_dir, f'masked_images_{opt.set}')
+    auto_segment_scene_ids = None
     if opt.auto_segment:
-        prepare_auto_segmented_inputs(opt, test_image_dir)
+        auto_segment_scene_ids = prepare_auto_segmented_inputs(opt, test_image_dir)
+        if opt.segment_only:
+            sys.exit(0)
     assert os.path.exists(test_image_dir), f"Test image directory {test_image_dir} does not exist"
 
     scene_output_dir = os.path.join(opt.output_dir, f'scene_{opt.set}_{opt.model_name}')
@@ -121,6 +183,8 @@ if __name__ == "__main__":
 
     scene_ids = os.listdir(test_image_dir)
     scene_ids = sorted(scene_ids)
+    if auto_segment_scene_ids is not None:
+        scene_ids = [sid for sid in scene_ids if sid in auto_segment_scene_ids]
 
     existing_ids = {f.split('.')[0] for f in os.listdir(scene_output_dir) if f.endswith('.glb')}
     scene_ids = [sid for sid in scene_ids if sid not in existing_ids]

@@ -11,6 +11,7 @@ from scenegen.segmentation import (
     build_result_from_annotations,
     preprocess_image_for_segmentation,
     save_scene_input,
+    segment_image,
     transform_boxes_for_preprocessed_image,
 )
 
@@ -144,6 +145,75 @@ class AutoSegmentTest(unittest.TestCase):
         self.assertIn("manifest.json", debug_names)
         self.assertIn("segmentation_overlay.png", debug_names)
         self.assertIn("mask_contact_sheet.png", debug_names)
+
+    def test_segment_image_routes_hybrid_boxes_without_loading_models(self):
+        config = AutoSegmentationConfig(
+            segmentation_mode="hybrid",
+            image_preprocess="none",
+            min_area_ratio=0.01,
+        )
+
+        class FakeDetector:
+            def detect(self, image):
+                return [DetectionBox(bbox=(2, 2, 12, 12), label="bed", score=0.8)]
+
+        class FakeBoxSegmenter:
+            def segment_boxes(self, image, boxes, mode, preprocessing=None, warnings=None):
+                mask = np.zeros((20, 20), dtype=bool)
+                left, top, right, bottom = boxes[0].bbox
+                mask[top:bottom, left:right] = True
+                return build_result_from_annotations(
+                    image,
+                    [{"segmentation": mask, "label": boxes[0].label, "score": boxes[0].score}],
+                    config,
+                    mode=mode,
+                    preprocessing=preprocessing,
+                    warnings=warnings,
+                )
+
+        result = segment_image(
+            Image.new("RGB", (20, 20), "white"),
+            config=config,
+            detector=FakeDetector(),
+            box_segmenter=FakeBoxSegmenter(),
+        )
+
+        self.assertEqual(result.mode, "hybrid")
+        self.assertEqual(len(result.instances), 1)
+        self.assertEqual(result.instances[0].label, "bed")
+
+    def test_segment_image_falls_back_to_auto_masks_when_hybrid_has_no_boxes(self):
+        config = AutoSegmentationConfig(
+            segmentation_mode="hybrid",
+            image_preprocess="none",
+            min_area_ratio=0.01,
+        )
+
+        class EmptyDetector:
+            def detect(self, image):
+                return []
+
+        class FakeAutoSegmenter:
+            def segment(self, image):
+                mask = np.zeros((20, 20), dtype=bool)
+                mask[4:12, 4:12] = True
+                return build_result_from_annotations(
+                    image,
+                    [{"segmentation": mask, "score": 0.8}],
+                    config,
+                    mode="sam2_auto",
+                )
+
+        result = segment_image(
+            Image.new("RGB", (20, 20), "white"),
+            config=config,
+            detector=EmptyDetector(),
+            auto_segmenter=FakeAutoSegmenter(),
+        )
+
+        self.assertEqual(result.mode, "sam2_auto_fallback")
+        self.assertEqual(len(result.instances), 1)
+        self.assertTrue(any("produced no boxes" in warning for warning in result.warnings))
 
 
 if __name__ == "__main__":
