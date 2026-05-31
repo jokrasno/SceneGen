@@ -104,7 +104,7 @@ This script processes a directory of pre-segmented images.
   ```
 
 ### Automatic Single-Image Segmentation
-For raw scene photos, `inference.py` can create instance masks first and then run the existing SceneGen generation path. This uses SAM2 automatic mask generation to write a standard `masked_images_<set>/<scene_id>` folder with one `N.png` / `N_mask.png` pair per detected instance.
+For raw scene photos, `inference.py` can create instance masks first and then run the existing SceneGen generation path. The default mode is `hybrid`: a zero-shot detector proposes object boxes, SAM2 refines those boxes into masks, and SAM2 automatic masks are used as a fallback when no boxes are found. The output is still the standard `masked_images_<set>/<scene_id>` folder with one `N.png` / `N_mask.png` pair per accepted instance.
 
 ```sh
 python inference.py \
@@ -121,7 +121,40 @@ The exported GLB will be written to:
 outputs/my_scene/scene_test_SceneGen/<scene_id>.glb
 ```
 
-Automatic segmentation requires SAM2 to be installed and a SAM2 checkpoint to exist at `checkpoints/sam2-hiera-large/sam2_hiera_large.pt`, or pass `--sam2_checkpoint` and `--sam2_model_cfg` explicitly. The generated label map and manifest are saved under each scene's `_auto_segmentation/` debug folder so the batch loader only sees the normal SceneGen files.
+Use `--segment_only` to inspect masks before spending GPU time on the 3D generation step:
+
+```sh
+python inference.py \
+  --auto_segment \
+  --segment_only \
+  --input_image /path/to/scene.jpg \
+  --output_dir outputs/my_scene \
+  --set test
+```
+
+Each scene gets an `_auto_segmentation/` debug folder containing `manifest.json`, `label_map.png`, `label_map_preview.png`, `segmentation_overlay.png`, and `mask_contact_sheet.png`. By default, person masks and room-surface masks such as walls/floors/ceilings are filtered, and large plane-like masks are not written as SceneGen batch inputs unless `--allow_low_quality_masks` is passed.
+
+To reproduce the original interactive-demo behavior from the CLI, provide manual boxes and use SAM2 box-guided masks:
+
+```json
+[
+  {"label": "bed", "bbox": [540, 700, 1600, 1450]},
+  {"label": "chair", "bbox": [120, 820, 480, 1450]}
+]
+```
+
+```sh
+python inference.py \
+  --auto_segment \
+  --segmentation_mode manual_boxes \
+  --boxes_json boxes.json \
+  --input_image /path/to/scene.jpg \
+  --output_dir outputs/my_scene \
+  --set test \
+  --model_name SceneGen
+```
+
+Automatic segmentation requires SAM2 to be installed and a SAM2 checkpoint to exist at `checkpoints/sam2-hiera-large/sam2_hiera_large.pt`, or pass `--sam2_checkpoint` and `--sam2_model_cfg` explicitly. Hybrid mode also uses the Transformers zero-shot detection pipeline, defaulting to `IDEA-Research/grounding-dino-tiny`.
 
 ## 📚 Dataset
 To train and evaluate SceneGen, we use the [3D-FUTURE](https://tianchi.aliyun.com/dataset/98063) dataset. Please download and preprocess the dataset as follows:
