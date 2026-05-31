@@ -224,13 +224,41 @@ def generate_colored_segmentation(label_image):
     return label_image_pil
 
 
-def plot_segmentation(image, detections):
+def detections_to_label_map(image, detections):
     seg_map = np.zeros(image.size[::-1], dtype=np.uint8)
     for i, detection in enumerate(detections):
+        if i >= 254:
+            break
         mask = detection.mask
+        if mask is None:
+            continue
         seg_map[mask > 0] = i + 1
-    seg_map_pil = generate_colored_segmentation(seg_map)
-    return seg_map_pil
+    return Image.fromarray(seg_map, mode="L")
+
+
+def colorize_label_map(label_map):
+    if isinstance(label_map, Image.Image):
+        label_array = np.asarray(label_map.convert("L"))
+    else:
+        label_array = np.asarray(label_map)
+    return generate_colored_segmentation(label_array).convert("RGB")
+
+
+def overlay_label_map(image, label_map, alpha: float = 0.55):
+    rgb_array = np.asarray(image.convert("RGB")).copy()
+    label_array = np.asarray(label_map.convert("L") if isinstance(label_map, Image.Image) else label_map)
+    color_array = np.asarray(colorize_label_map(label_array))
+    mask = label_array > 0
+    rgb_array[mask] = (
+        rgb_array[mask].astype(np.float32) * (1.0 - alpha)
+        + color_array[mask].astype(np.float32) * alpha
+    ).astype(np.uint8)
+    return Image.fromarray(rgb_array, mode="RGB")
+
+
+def plot_segmentation(image, detections):
+    label_map = detections_to_label_map(image, detections)
+    return colorize_label_map(label_map)
 
 
 # Grounded SAM
@@ -314,15 +342,10 @@ def segment(
         with amp_ctx:
             predictor.set_image(np_image)
 
-            # Boxes to tensor
-            boxes_t = torch.tensor(boxes, dtype=torch.float32, device=device)
-            # Transform boxes if predictor exposes a transform like SAM/SAM2
-            if hasattr(predictor, "transform") and hasattr(predictor.transform, "apply_boxes_torch"):
-                boxes_in = predictor.transform.apply_boxes_torch(boxes_t, np_image.shape[:2])
-            else:
-                boxes_in = boxes_t
+            boxes_in = np.asarray(boxes, dtype=np.float32)
 
-            # Predict masks for boxes; request single mask per box
+            # SAM2ImagePredictor.predict expects original image-space XYXY boxes.
+            # It handles normalization and model-space transforms internally.
             masks, scores, _ = predictor.predict(
                 box=boxes_in,
                 multimask_output=False

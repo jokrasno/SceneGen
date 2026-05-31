@@ -13,8 +13,8 @@ from gradio_litmodel3d import LitModel3D
 from huggingface_hub import snapshot_download
 from PIL import Image
 from scenegen.pipelines import SceneGenImageToScenePipeline
-from scenegen.utils.grounding_sam import plot_segmentation, segment
-from scenegen.utils.inference_scene import run_scene
+from scenegen.utils.grounding_sam import detections_to_label_map, overlay_label_map, segment
+from scenegen.utils.inference_scene import run_scene, seg_image_to_label_map
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
@@ -41,26 +41,32 @@ def run_segmentation(image_prompts: Any, polygon_refinement: bool, image_collect
 
     if len(image_prompts["points"]) == 0:
         gr.Error("No points provided for segmentation. Please add points to the image.")
-        return None, image_collection, seg_collection
+        return None, image_collection, seg_collection, None
     
     boxes = [
-        [
-            [int(box[0]), int(box[1]), int(box[3]), int(box[4])]
-            for box in image_prompts["points"]
-        ]
+        [int(box[0]), int(box[1]), int(box[3]), int(box[4])]
+        for box in image_prompts["points"]
+        if len(box) >= 5 and int(box[2]) == 2
     ]
+    if len(boxes) == 0:
+        gr.Error("No bounding boxes provided for segmentation. Draw boxes around objects, not single points.")
+        return None, image_collection, seg_collection, None
 
     detections = segment(
         sam2_predictor,
         rgb_image,
-        boxes=[boxes],
+        boxes=boxes,
         polygon_refinement=polygon_refinement,
     )
-    seg_map_pil = plot_segmentation(rgb_image, detections)
+    label_map = detections_to_label_map(rgb_image, detections)
+    if len(np.unique(np.asarray(label_map))) <= 1:
+        gr.Error("SAM2 returned an empty segmentation. Try drawing a tighter box around the object.")
+        return None, image_collection, seg_collection, None
+    seg_map_pil = overlay_label_map(rgb_image, label_map)
     
     torch.cuda.empty_cache()
 
-    return seg_map_pil, image_collection, seg_collection
+    return seg_map_pil, image_collection, seg_collection, label_map
 
 def add_to_cache(rgb_image, seg_image, image_collection, seg_collection):
     if rgb_image is None or seg_image is None:
@@ -80,8 +86,8 @@ def add_to_cache(rgb_image, seg_image, image_collection, seg_collection):
 def create_preview_images(image_collection, seg_collection):
     concat_image_collection = []
     for i in range(len(image_collection)):
-        img_rgb = image_collection[i]
-        img_seg = seg_collection[i]
+        img_rgb = image_collection[i].convert("RGB")
+        img_seg = overlay_label_map(img_rgb, seg_image_to_label_map(seg_collection[i]))
 
         if img_rgb.height != img_seg.height:
             aspect_ratio = img_seg.width / float(img_seg.height)
@@ -160,24 +166,32 @@ def run_generation(
     if randomize_seed:
         seed = random.randint(0, MAX_SEED)
 
-    scene = run_scene(
-        pipeline,
-        rgb_image,
-        seg_image,
-        seed=seed,
-        ss_num_inference_steps= ss_num_inference_steps,
-        ss_cfg_strength=ss_cfg_strength,
-        ss_cfg_interval=ss_cfg_interval,
-        ss_rescale_t=ss_rescale_t,
-        slat_num_inference_steps=slat_num_inference_steps,
-        slat_cfg_strength=slat_cfg_strength,
-        slat_cfg_interval=slat_cfg_interval,
-        slat_rescale_t=slat_rescale_t,
-        order=asset_order,
-        positions_type=positions_type,
-        simplify=simplify,
-        texture_size=texture_size,
-    )
+    try:
+        scene = run_scene(
+            pipeline,
+            rgb_image,
+            seg_image,
+            seed=seed,
+            ss_num_inference_steps= ss_num_inference_steps,
+            ss_cfg_strength=ss_cfg_strength,
+            ss_cfg_interval=ss_cfg_interval,
+            ss_rescale_t=ss_rescale_t,
+            slat_num_inference_steps=slat_num_inference_steps,
+            slat_cfg_strength=slat_cfg_strength,
+            slat_cfg_interval=slat_cfg_interval,
+            slat_rescale_t=slat_rescale_t,
+            order=asset_order,
+            positions_type=positions_type,
+            simplify=simplify,
+            texture_size=texture_size,
+        )
+    except RuntimeError as exc:
+        torch.cuda.empty_cache()
+        message = str(exc)
+        if "cuda" in message.lower() or "cudamalloc" in message.lower():
+            gr.Error("Generation ran out of GPU memory. Try texture size 512, fewer/larger object boxes, or clear/retry.")
+            return None, None, seed
+        raise
 
     _, tmp_path = tempfile.mkstemp(suffix=".glb", prefix="scenegen_", dir=TMP_DIR)
     scene.export(tmp_path)
@@ -194,13 +208,14 @@ def load_example(scene_data, mask_path):
         img_rgb = Image.open(scene_data["image"]).convert("RGB")
     else:
         img_rgb = Image.open(scene_data).convert("RGB")
-    img_seg = Image.open(mask_path).convert("RGB")
+    img_seg_label = seg_image_to_label_map(Image.open(mask_path))
+    img_seg = overlay_label_map(img_rgb, img_seg_label)
     
     image_prompts_value = {"image": img_rgb, "points": []}
     
     print("Example loaded successfully!")  # 这个应该会打印
     
-    return image_prompts_value, img_seg, img_rgb
+    return image_prompts_value, img_seg, img_rgb, img_seg_label
 
 # Demo
 with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="indigo")) as demo:
@@ -209,6 +224,7 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="indigo"))
     seg_collection = gr.State([])
 
     current_image = gr.State(None)
+    current_seg_label = gr.State(None)
     selected_image_idx = gr.State(None)
 
     # Inject CSS to change Generation Controls border to a lighter blue
@@ -368,7 +384,7 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="indigo"))
     def action_add_new_image():
         cleared_image_prompts = None
         cleared_seg_image = None
-        return cleared_image_prompts, cleared_seg_image, None
+        return cleared_image_prompts, cleared_seg_image, None, None
 
     def select_cached_image(evt: gr.SelectData):
         return evt.index
@@ -445,7 +461,7 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="indigo"))
                             texture_size = gr.Dropdown(
                                 label="Texture Size",
                                 choices=[512, 1024, 2048, 4096],
-                                value=1024,
+                                value=512,
                                 type="value",
                                 allow_custom_value=False
                             )
@@ -542,7 +558,7 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="indigo"))
     add_new_image_button.click(
         fn=action_add_new_image,
         inputs=None,
-        outputs=[image_prompts, seg_image, current_image]
+        outputs=[image_prompts, seg_image, current_image, current_seg_label],
     )
 
     seg_button.click(
@@ -551,38 +567,39 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="indigo"))
             image_prompts,
             polygon_refinement,
             image_collection,
-            seg_collection
+            seg_collection,
         ],
         outputs=[
             seg_image,
             image_collection,
             seg_collection,
+            current_seg_label,
         ],
     ).then(
         lambda img_prompts: img_prompts["image"] if isinstance(img_prompts, dict) and "image" in img_prompts else None,
         inputs=[image_prompts],
-        outputs=[current_image]
+        outputs=[current_image],
     ).then(lambda: gr.Button(interactive=True), outputs=[add_to_cache_button])
 
     add_to_cache_button.click(
         add_to_cache,
         inputs=[
             current_image,
-            seg_image,
+            current_seg_label,
             image_collection,
-            seg_collection
+            seg_collection,
         ],
         outputs=[
             image_collection,
             seg_collection,
-            cached_images_gallery
+            cached_images_gallery,
         ],
     ).then(lambda: gr.Button(interactive=True), outputs=[gen_button])
 
     cached_images_gallery.select(
         select_cached_image,
         inputs=None,
-        outputs=[selected_image_idx]
+        outputs=[selected_image_idx],
     )
 
     delete_selected_button.click(
@@ -590,19 +607,19 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="indigo"))
         inputs=[
             selected_image_idx,
             image_collection,
-            seg_collection
+            seg_collection,
         ],
         outputs=[
             image_collection,
             seg_collection,
-            cached_images_gallery
+            cached_images_gallery,
         ],
     ).then(lambda: None, outputs=[selected_image_idx])
 
     clear_cache_button.click(
         clear_cache,
         inputs=[],
-        outputs=[image_collection, seg_collection, cached_images_gallery]
+        outputs=[image_collection, seg_collection, cached_images_gallery],
     )
 
     gen_button.click(
@@ -634,7 +651,7 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="indigo"))
     example_dir = "assets/gradio_demos"
     if os.path.exists(example_dir):
         example_folders = sorted([os.path.join(example_dir, d) for d in os.listdir(example_dir) if os.path.isdir(os.path.join(example_dir, d))])
-        
+
         examples = []
         for folder in example_folders:
             scene_path = os.path.join(folder, "scene.jpg")
@@ -648,64 +665,81 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="indigo"))
                     example_images = gr.Examples(
                         examples=examples,
                         inputs=[image_prompts, seg_image],
-                        outputs=[image_prompts, seg_image, current_image],
+                        outputs=[image_prompts, seg_image, current_image, current_seg_label],
                         fn=load_example,
-                        examples_per_page=7
+                        examples_per_page=7,
                     )
-                
+
                 with gr.Row():
                     auto_process_button = gr.Button("🚀 Load Example & Auto Generate", variant="primary", size="lg")
-                
-            def auto_process_example(image_prompts, seg_image, image_collection, seg_collection,
-                                   seed, randomize_seed, ss_num_inference_steps, ss_cfg_strength,
-                                   ss_cfg_interval_start, ss_cfg_interval_end, ss_rescale_t,
-                                   slat_num_inference_steps, slat_cfg_strength, slat_cfg_interval_start,
-                                   slat_cfg_interval_end, slat_rescale_t, asset_order,
-                                   positions_type, simplify, texture_size):
-                
+
+            def auto_process_example(
+                image_prompts,
+                seg_image,
+                current_seg_label,
+                image_collection,
+                seg_collection,
+                seed,
+                randomize_seed,
+                ss_num_inference_steps,
+                ss_cfg_strength,
+                ss_cfg_interval_start,
+                ss_cfg_interval_end,
+                ss_rescale_t,
+                slat_num_inference_steps,
+                slat_cfg_strength,
+                slat_cfg_interval_start,
+                slat_cfg_interval_end,
+                slat_rescale_t,
+                asset_order,
+                positions_type,
+                simplify,
+                texture_size,
+            ):
                 print("Auto processing example...")
-                
-                if image_prompts is None or seg_image is None:
+
+                if image_prompts is None or (seg_image is None and current_seg_label is None):
                     gr.Warning("Please select an example first!")
                     return (image_collection, seg_collection, None, None, None, None)
-                
+
                 rgb_image = image_prompts["image"] if isinstance(image_prompts, dict) and "image" in image_prompts else image_prompts
-                
+                seg_label = current_seg_label if current_seg_label is not None else seg_image_to_label_map(seg_image)
+
                 new_image_collection = []
                 new_seg_collection = []
                 new_image_collection.append(rgb_image)
-                new_seg_collection.append(seg_image)
+                new_seg_collection.append(seg_label)
                 preview_images = create_preview_images(new_image_collection, new_seg_collection)
-                
+
                 print(f"Added to cache. Total images: {len(new_image_collection)}")
-                
+
                 model_path, download_path, new_seed = run_generation(
                     new_image_collection, new_seg_collection, seed, randomize_seed,
                     ss_num_inference_steps, ss_cfg_strength, ss_cfg_interval_start,
                     ss_cfg_interval_end, ss_rescale_t, slat_num_inference_steps,
                     slat_cfg_strength, slat_cfg_interval_start, slat_cfg_interval_end,
-                    slat_rescale_t, asset_order, positions_type, simplify, texture_size
+                    slat_rescale_t, asset_order, positions_type, simplify, texture_size,
                 )
-                
+
                 print("Generation completed!")
-                
+
                 return (new_image_collection, new_seg_collection, preview_images,
                         model_path, download_path, new_seed)
-            
+
             auto_process_button.click(
                 auto_process_example,
                 inputs=[
-                    image_prompts, seg_image, image_collection, seg_collection,
+                    image_prompts, seg_image, current_seg_label, image_collection, seg_collection,
                     seed, randomize_seed, ss_num_inference_steps, ss_cfg_strength,
                     ss_cfg_interval_start, ss_cfg_interval_end, ss_rescale_t,
                     slat_num_inference_steps, slat_cfg_strength, slat_cfg_interval_start,
                     slat_cfg_interval_end, slat_rescale_t, asset_order,
-                    positions_type, simplify, texture_size
+                    positions_type, simplify, texture_size,
                 ],
                 outputs=[
                     image_collection, seg_collection, cached_images_gallery,
-                    model_output, download_glb, seed
-                ]
+                    model_output, download_glb, seed,
+                ],
             ).then(lambda: gr.Button(interactive=True), outputs=[download_glb])
 
 demo.launch()

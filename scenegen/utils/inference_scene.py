@@ -9,13 +9,94 @@ from PIL import Image
 
 from ..pipelines import SceneGenImageToScenePipeline
 
+SEGMENTATION_PALETTE = [
+    (0, 0, 0),
+    (255, 0, 0),
+    (0, 255, 0),
+    (0, 0, 255),
+    (255, 255, 0),
+    (255, 0, 255),
+    (0, 255, 255),
+    (128, 0, 0),
+    (0, 128, 0),
+    (0, 0, 128),
+    (128, 128, 0),
+    (128, 0, 128),
+    (0, 128, 128),
+    (64, 0, 0),
+    (0, 64, 0),
+    (0, 0, 64),
+    (64, 64, 0),
+    (64, 0, 64),
+    (0, 64, 64),
+    (192, 192, 192),
+    (128, 128, 128),
+    (255, 165, 0),
+    (75, 0, 130),
+    (238, 130, 238),
+]
+
+
+def seg_image_to_label_map(seg_image: Union[str, Image.Image]) -> Image.Image:
+    if isinstance(seg_image, str):
+        seg_image = Image.open(seg_image)
+
+    if seg_image.mode in ("L", "P"):
+        return seg_image.copy().convert("L") if seg_image.mode == "L" else Image.fromarray(np.asarray(seg_image), mode="L")
+    if seg_image.mode in ("I", "I;16"):
+        label_array = np.asarray(seg_image)
+        if label_array.max(initial=0) > 255:
+            raise ValueError("Segmentation labels must be in the 0..255 range.")
+        return Image.fromarray(label_array.astype(np.uint8), mode="L")
+
+    rgba = np.asarray(seg_image.convert("RGBA"))
+    rgb = rgba[..., :3]
+    alpha = rgba[..., 3]
+    foreground = (alpha > 0) & np.any(rgb != 0, axis=-1)
+    label_array = np.zeros(rgb.shape[:2], dtype=np.uint8)
+    if not foreground.any():
+        return Image.fromarray(label_array, mode="L")
+
+    palette_lookup = {color: idx for idx, color in enumerate(SEGMENTATION_PALETTE) if idx > 0}
+    used_labels = set(palette_lookup.values())
+    next_label = 1
+
+    foreground_colors = rgb[foreground]
+    unique_colors, inverse = np.unique(foreground_colors.reshape(-1, 3), axis=0, return_inverse=True)
+    if len(unique_colors) > 254:
+        raise ValueError("RGB segmentation mask has too many colors to convert to labels.")
+
+    labels_for_unique_colors = np.zeros(len(unique_colors), dtype=np.uint8)
+    for unique_index, color_array in enumerate(unique_colors):
+        color = tuple(int(channel) for channel in color_array)
+        label = palette_lookup.get(color)
+        if label is None:
+            while next_label in used_labels:
+                next_label += 1
+            if next_label > 254:
+                raise ValueError("RGB segmentation mask has too many colors to convert to labels.")
+            label = next_label
+            used_labels.add(label)
+            next_label += 1
+        labels_for_unique_colors[unique_index] = label
+
+    label_array[foreground] = labels_for_unique_colors[inverse]
+
+    return Image.fromarray(label_array, mode="L")
+
+
+def label_ids_from_seg_image(seg_image: Union[str, Image.Image]) -> np.ndarray:
+    label_map = seg_image_to_label_map(seg_image)
+    label_ids = np.unique(np.asarray(label_map))
+    return label_ids[label_ids > 0]
+
 def split_rgb_mask(rgb_image, seg_image, order: str) -> List[Image.Image]:
     if isinstance(rgb_image, str):
         rgb_image = Image.open(rgb_image)
     if isinstance(seg_image, str):
         seg_image = Image.open(seg_image)
     rgb_image = rgb_image.convert("RGB")
-    seg_image = seg_image.convert("L")
+    seg_image = seg_image_to_label_map(seg_image)
 
     rgb_array = np.array(rgb_image)
     seg_array = np.array(seg_image)
