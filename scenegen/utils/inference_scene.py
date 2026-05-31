@@ -22,6 +22,8 @@ def split_rgb_mask(rgb_image, seg_image, order: str) -> List[Image.Image]:
 
     label_ids = np.unique(seg_array)
     label_ids = label_ids[label_ids > 0]
+    if len(label_ids) == 0:
+        raise ValueError("Segmentation mask contains no non-background labels.")
 
     if order in ["smallest", "largest"]:
         # Sort label_ids by mask area (small to large)
@@ -100,6 +102,15 @@ def run_scene(
 ) -> trimesh.Scene:
     
     torch.manual_seed(seed)
+    if isinstance(rgb_image, (str, Image.Image)):
+        rgb_image = [rgb_image]
+    if isinstance(seg_image, (str, Image.Image)):
+        seg_image = [seg_image]
+
+    if len(rgb_image) == 0 or len(seg_image) == 0:
+        raise ValueError("At least one RGB image and segmentation mask are required.")
+    if len(rgb_image) != len(seg_image):
+        raise ValueError("RGB image and segmentation mask counts must match.")
 
     sparse_structure_sampler_params={
             "steps": ss_num_inference_steps,
@@ -154,5 +165,7 @@ def run_scene(
             texture_size=texture_size,
         )
         scene = results["scene"]
+    else:
+        raise ValueError("Unsupported RGB image and segmentation mask inputs.")
 
     return scene

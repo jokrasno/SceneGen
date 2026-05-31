@@ -139,14 +139,26 @@ def run_generation(
     simplify: float = 0.95,
     texture_size: int = 1024,
 ):
+    if not isinstance(rgb_image, Image.Image) and isinstance(rgb_image, dict) and "image" in rgb_image:
+        rgb_image = rgb_image["image"]
+    if isinstance(rgb_image, (str, Image.Image)):
+        rgb_image = [rgb_image]
+    if isinstance(seg_image, (str, Image.Image)):
+        seg_image = [seg_image]
+
+    if not rgb_image or not seg_image:
+        gr.Warning("No cached segmentation found. Run Segmentation, then click Add to Cache before generating.")
+        return None, None, seed
+
+    if len(rgb_image) != len(seg_image):
+        gr.Warning("Cached image and segmentation counts do not match. Clear the cache and add the segmented image again.")
+        return None, None, seed
+
     # Construct intervals from individual values
     ss_cfg_interval = [ss_cfg_interval_start, ss_cfg_interval_end]
     slat_cfg_interval = [slat_cfg_interval_start, slat_cfg_interval_end]
     if randomize_seed:
         seed = random.randint(0, MAX_SEED)
-
-    if not isinstance(rgb_image, Image.Image) and "image" in rgb_image:
-        rgb_image = rgb_image["image"]
 
     scene = run_scene(
         pipeline,
