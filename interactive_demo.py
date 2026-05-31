@@ -43,35 +43,19 @@ def run_segmentation(image_prompts: Any, polygon_refinement: bool, image_collect
         gr.Error("No points provided for segmentation. Please add points to the image.")
         return None, image_collection, seg_collection, None
     
-    boxes = []
-    point_prompts = []
-    for prompt in image_prompts["points"]:
-        if len(prompt) < 5:
-            continue
-        prompt_type = int(prompt[2])
-        if prompt_type == 2:
-            boxes.append([int(prompt[0]), int(prompt[1]), int(prompt[3]), int(prompt[4])])
-        elif prompt_type in (0, 1):
-            point_prompts.append((int(prompt[0]), int(prompt[1]), prompt_type))
+    boxes = [
+        [int(box[0]), int(box[1]), int(box[3]), int(box[4])]
+        for box in image_prompts["points"]
+        if len(box) >= 5 and int(box[2]) == 2
+    ]
     if len(boxes) == 0:
         gr.Error("No bounding boxes provided for segmentation. Draw boxes around objects, not single points.")
         return None, image_collection, seg_collection, None
-
-    point_prompts_by_box = []
-    for x0, y0, x1, y1 in boxes:
-        box_coords = []
-        box_labels = []
-        for px, py, label in point_prompts:
-            if x0 <= px <= x1 and y0 <= py <= y1:
-                box_coords.append([px, py])
-                box_labels.append(label)
-        point_prompts_by_box.append((box_coords, box_labels))
 
     detections = segment(
         sam2_predictor,
         rgb_image,
         boxes=boxes,
-        point_prompts_by_box=point_prompts_by_box,
         polygon_refinement=polygon_refinement,
     )
     label_map = detections_to_label_map(rgb_image, detections)
