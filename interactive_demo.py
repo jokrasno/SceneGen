@@ -88,9 +88,14 @@ def add_to_cache(current_image, current_seg_label, image_prompts, visible_seg_im
     rgb_image = current_image
     if rgb_image is None and isinstance(image_prompts, dict) and "image" in image_prompts:
         rgb_image = image_prompts["image"]
-    seg_image = current_seg_label
+    use_visible_example_mask = (
+        isinstance(image_prompts, dict)
+        and len(image_prompts.get("points") or []) == 0
+        and visible_seg_image is not None
+    )
+    seg_image = visible_seg_image if use_visible_example_mask else current_seg_label
     if seg_image is None and visible_seg_image is not None:
-        seg_image = seg_image_to_label_map(visible_seg_image)
+        seg_image = visible_seg_image
 
     if rgb_image is None or seg_image is None:
         gr.Warning("No image or segmentation to add to cache.")
@@ -731,7 +736,7 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="indigo"))
                     return (image_collection, seg_collection, None, None, None, None)
 
                 rgb_image = image_prompts["image"] if isinstance(image_prompts, dict) and "image" in image_prompts else image_prompts
-                seg_label = current_seg_label if current_seg_label is not None else seg_image_to_label_map(seg_image)
+                seg_label = seg_image_to_label_map(seg_image) if seg_image is not None else current_seg_label
 
                 new_image_collection = []
                 new_seg_collection = []
