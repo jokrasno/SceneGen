@@ -13,7 +13,7 @@ from gradio_litmodel3d import LitModel3D
 from huggingface_hub import snapshot_download
 from PIL import Image
 from scenegen.pipelines import SceneGenImageToScenePipeline
-from scenegen.utils.grounding_sam import detections_to_label_map, overlay_label_map, segment
+from scenegen.utils.grounding_sam import colorize_label_map, detections_to_label_map, overlay_label_map, segment
 from scenegen.utils.inference_scene import run_scene, seg_image_to_label_map
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -43,19 +43,35 @@ def run_segmentation(image_prompts: Any, polygon_refinement: bool, image_collect
         gr.Error("No points provided for segmentation. Please add points to the image.")
         return None, image_collection, seg_collection, None
     
-    boxes = [
-        [int(box[0]), int(box[1]), int(box[3]), int(box[4])]
-        for box in image_prompts["points"]
-        if len(box) >= 5 and int(box[2]) == 2
-    ]
+    boxes = []
+    point_prompts = []
+    for prompt in image_prompts["points"]:
+        if len(prompt) < 5:
+            continue
+        prompt_type = int(prompt[2])
+        if prompt_type == 2:
+            boxes.append([int(prompt[0]), int(prompt[1]), int(prompt[3]), int(prompt[4])])
+        elif prompt_type in (0, 1):
+            point_prompts.append((int(prompt[0]), int(prompt[1]), prompt_type))
     if len(boxes) == 0:
         gr.Error("No bounding boxes provided for segmentation. Draw boxes around objects, not single points.")
         return None, image_collection, seg_collection, None
+
+    point_prompts_by_box = []
+    for x0, y0, x1, y1 in boxes:
+        box_coords = []
+        box_labels = []
+        for px, py, label in point_prompts:
+            if x0 <= px <= x1 and y0 <= py <= y1:
+                box_coords.append([px, py])
+                box_labels.append(label)
+        point_prompts_by_box.append((box_coords, box_labels))
 
     detections = segment(
         sam2_predictor,
         rgb_image,
         boxes=boxes,
+        point_prompts_by_box=point_prompts_by_box,
         polygon_refinement=polygon_refinement,
     )
     label_map = detections_to_label_map(rgb_image, detections)
@@ -68,16 +84,26 @@ def run_segmentation(image_prompts: Any, polygon_refinement: bool, image_collect
 
     return seg_map_pil, image_collection, seg_collection, label_map
 
-def add_to_cache(rgb_image, seg_image, image_collection, seg_collection):
+def add_to_cache(current_image, current_seg_label, image_prompts, visible_seg_image, image_collection, seg_collection):
+    rgb_image = current_image
+    if rgb_image is None and isinstance(image_prompts, dict) and "image" in image_prompts:
+        rgb_image = image_prompts["image"]
+    seg_image = current_seg_label
+    if seg_image is None and visible_seg_image is not None:
+        seg_image = seg_image_to_label_map(visible_seg_image)
+
     if rgb_image is None or seg_image is None:
         gr.Warning("No image or segmentation to add to cache.")
+        return image_collection, seg_collection, None
+    if len(np.unique(np.asarray(seg_image_to_label_map(seg_image)))) <= 1:
+        gr.Warning("Segmentation has no object labels. Run segmentation or select a valid example mask first.")
         return image_collection, seg_collection, None
     
     new_image_collection = image_collection.copy()
     new_seg_collection = seg_collection.copy()
     
-    new_image_collection.append(rgb_image)
-    new_seg_collection.append(seg_image)
+    new_image_collection.append(rgb_image.convert("RGB"))
+    new_seg_collection.append(seg_image_to_label_map(seg_image))
     
     preview_images = create_preview_images(new_image_collection, new_seg_collection)
     
@@ -209,13 +235,13 @@ def load_example(scene_data, mask_path):
     else:
         img_rgb = Image.open(scene_data).convert("RGB")
     img_seg_label = seg_image_to_label_map(Image.open(mask_path))
-    img_seg = overlay_label_map(img_rgb, img_seg_label)
+    img_seg = colorize_label_map(img_seg_label)
     
     image_prompts_value = {"image": img_rgb, "points": []}
     
     print("Example loaded successfully!")  # 这个应该会打印
     
-    return image_prompts_value, img_seg, img_rgb, img_seg_label
+    return image_prompts_value, img_seg
 
 # Demo
 with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="indigo")) as demo:
@@ -586,6 +612,8 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="indigo"))
         inputs=[
             current_image,
             current_seg_label,
+            image_prompts,
+            seg_image,
             image_collection,
             seg_collection,
         ],
@@ -665,7 +693,7 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="indigo"))
                     example_images = gr.Examples(
                         examples=examples,
                         inputs=[image_prompts, seg_image],
-                        outputs=[image_prompts, seg_image, current_image, current_seg_label],
+                        outputs=[image_prompts, seg_image],
                         fn=load_example,
                         examples_per_page=7,
                     )

@@ -302,6 +302,7 @@ def segment(
     predictor: Any,
     image: Image.Image,
     boxes: Optional[List[List[List[float]]]] = None,
+    point_prompts_by_box: Optional[List[Tuple[List[List[float]], List[int]]]] = None,
     detection_results: Optional[List[Dict[str, Any]]] = None,
     polygon_refinement: bool = False,
 ) -> List[DetectionResult]:
@@ -315,8 +316,14 @@ def segment(
     # Build boxes from detections if not provided
     if boxes is None:
         boxes = get_boxes(detection_results)
-    # Flatten potential [[...], ...] -> [...]
-    if isinstance(boxes, list) and len(boxes) == 1 and isinstance(boxes[0], list):
+    # Flatten legacy [[[...], ...]] input, but keep a single [x0, y0, x1, y1] box intact.
+    if (
+        isinstance(boxes, list)
+        and len(boxes) == 1
+        and isinstance(boxes[0], list)
+        and len(boxes[0]) > 0
+        and isinstance(boxes[0][0], list)
+    ):
         boxes = boxes[0]
 
     # Ensure image is a numpy RGB array (H, W, 3)
@@ -342,14 +349,32 @@ def segment(
         with amp_ctx:
             predictor.set_image(np_image)
 
-            boxes_in = np.asarray(boxes, dtype=np.float32)
+            masks_for_boxes = []
+            scores_for_boxes = []
+            for box_index, box in enumerate(boxes):
+                points = None
+                point_labels = None
+                if point_prompts_by_box is not None and box_index < len(point_prompts_by_box):
+                    box_points, box_point_labels = point_prompts_by_box[box_index]
+                    if box_points:
+                        points = np.asarray(box_points, dtype=np.float32)
+                        point_labels = np.asarray(box_point_labels, dtype=np.int32)
 
-            # SAM2ImagePredictor.predict expects original image-space XYXY boxes.
-            # It handles normalization and model-space transforms internally.
-            masks, scores, _ = predictor.predict(
-                box=boxes_in,
-                multimask_output=False
-            )
+                # SAM2ImagePredictor.predict expects original image-space prompts.
+                # It handles normalization and model-space transforms internally.
+                mask_candidates, score_candidates, _ = predictor.predict(
+                    point_coords=points,
+                    point_labels=point_labels,
+                    box=np.asarray(box, dtype=np.float32),
+                    multimask_output=True,
+                )
+                best_index = int(np.argmax(score_candidates))
+                mask = _clip_mask_to_box(mask_candidates[best_index], box, np_image.shape[:2])
+                masks_for_boxes.append(mask)
+                scores_for_boxes.append(float(score_candidates[best_index]))
+
+            masks = np.stack(masks_for_boxes, axis=0)
+            scores = np.asarray(scores_for_boxes, dtype=np.float32)
 
     # Normalize masks to numpy [N, H, W] boolean
     if isinstance(masks, torch.Tensor):
@@ -372,3 +397,17 @@ def segment(
         detection_result.mask = mask
 
     return detection_results
+
+
+def _clip_mask_to_box(mask: np.ndarray, box: List[float], image_shape: Tuple[int, int]) -> np.ndarray:
+    height, width = image_shape
+    x0, y0, x1, y1 = [int(round(value)) for value in box]
+    x0 = max(0, min(width, x0))
+    x1 = max(0, min(width, x1))
+    y0 = max(0, min(height, y0))
+    y1 = max(0, min(height, y1))
+    if x1 <= x0 or y1 <= y0:
+        return mask
+    clipped = np.zeros((height, width), dtype=bool)
+    clipped[y0:y1, x0:x1] = True
+    return np.asarray(mask).astype(bool) & clipped
