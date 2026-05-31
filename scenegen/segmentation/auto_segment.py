@@ -257,7 +257,10 @@ class ZeroShotBoxDetector:
         return cls(detector, config)
 
     def detect(self, image: Image.Image) -> list[DetectionBox]:
-        labels = [label if label.endswith(".") else label + "." for label in self.config.auto_labels]
+        candidate_labels = list(self.config.auto_labels)
+        if self.config.exclude_people and "person" not in {_clean_label(label) for label in candidate_labels}:
+            candidate_labels.append("person")
+        labels = [label if label.endswith(".") else label + "." for label in candidate_labels]
         results = self.detector(
             image,
             candidate_labels=labels,
@@ -412,7 +415,7 @@ def build_result_from_annotations(
     result_warnings = list(warnings or [])
     rejected: list[dict[str, Any]] = []
 
-    candidates: list[dict[str, Any]] = []
+    entries: list[dict[str, Any]] = []
     for index, annotation in enumerate(annotations):
         mask = _annotation_mask(annotation, (height, width))
         area = int(mask.sum())
@@ -422,6 +425,44 @@ def build_result_from_annotations(
         if bbox is None:
             rejected.append(_rejected_entry(index, label, None, area, "empty_mask", score))
             continue
+        entries.append(
+            {
+                "source_index": index,
+                "mask": mask,
+                "area": area,
+                "bbox": bbox,
+                "score": score,
+                "label": label,
+            }
+        )
+
+    excluded_people = np.zeros((height, width), dtype=bool)
+    if config.exclude_people:
+        for entry in entries:
+            if entry["label"] in PERSON_LABELS:
+                excluded_people |= entry["mask"]
+
+    candidates: list[dict[str, Any]] = []
+    for entry in entries:
+        index = entry["source_index"]
+        mask = entry["mask"]
+        area = entry["area"]
+        bbox = entry["bbox"]
+        label = entry["label"]
+        score = entry["score"]
+
+        if config.exclude_people and label in PERSON_LABELS:
+            rejected.append(_rejected_entry(index, label, bbox, area, "excluded_person", score))
+            continue
+
+        if excluded_people.any():
+            mask = mask & ~excluded_people
+            area = int(mask.sum())
+            bbox = _bbox_from_mask(mask)
+            if bbox is None:
+                rejected.append(_rejected_entry(index, label, None, area, "removed_by_excluded_person", score))
+                continue
+
         if area < min_area:
             rejected.append(_rejected_entry(index, label, bbox, area, "too_small", score))
             continue

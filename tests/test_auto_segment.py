@@ -124,6 +124,27 @@ class AutoSegmentTest(unittest.TestCase):
         self.assertIn("excluded_room_surface", reasons)
         self.assertTrue(result.quality_passed)
 
+    def test_excluded_people_are_subtracted_from_object_masks(self):
+        image = Image.new("RGB", (20, 20), "white")
+        person_mask = np.zeros((20, 20), dtype=bool)
+        person_mask[4:10, 4:10] = True
+        artwork_mask = np.zeros((20, 20), dtype=bool)
+        artwork_mask[2:12, 2:12] = True
+
+        result = build_result_from_annotations(
+            image,
+            [
+                {"segmentation": person_mask, "label": "person", "score": 0.9},
+                {"segmentation": artwork_mask, "label": "artwork", "score": 0.8},
+            ],
+            AutoSegmentationConfig(min_area_ratio=0.01),
+            mode="hybrid",
+        )
+
+        self.assertEqual(len(result.instances), 1)
+        self.assertEqual(result.instances[0].label, "artwork")
+        self.assertEqual(result.instances[0].area, int(artwork_mask.sum() - person_mask.sum()))
+
     def test_save_scene_input_can_write_debug_without_batch_masks(self):
         image = Image.new("RGB", (10, 10), "white")
         result = build_result_from_annotations(
