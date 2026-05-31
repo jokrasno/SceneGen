@@ -5,7 +5,14 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from scenegen.segmentation import AutoSegmentationConfig, build_result_from_annotations, save_scene_input
+from scenegen.segmentation import (
+    AutoSegmentationConfig,
+    DetectionBox,
+    build_result_from_annotations,
+    preprocess_image_for_segmentation,
+    save_scene_input,
+    transform_boxes_for_preprocessed_image,
+)
 
 
 class AutoSegmentTest(unittest.TestCase):
@@ -54,6 +61,89 @@ class AutoSegmentTest(unittest.TestCase):
         self.assertIn("masked_scene.png", names)
         self.assertIn("_auto_segmentation", names)
         self.assertNotIn("label_map.png", names)
+
+    def test_preprocess_auto_crops_portrait_and_scales(self):
+        image = Image.new("RGB", (100, 160), "white")
+
+        processed, metadata = preprocess_image_for_segmentation(
+            image,
+            AutoSegmentationConfig(
+                image_preprocess="auto",
+                segment_max_side=50,
+                portrait_crop_ratio=1.2,
+            ),
+        )
+
+        self.assertEqual(processed.size, (50, 50))
+        self.assertEqual(metadata["crop_box"], [0, 30, 100, 130])
+        self.assertEqual(metadata["output_size"], [50, 50])
+        self.assertAlmostEqual(metadata["scale"], 0.5)
+
+    def test_manual_boxes_transform_through_preprocessing(self):
+        _, metadata = preprocess_image_for_segmentation(
+            Image.new("RGB", (100, 160), "white"),
+            AutoSegmentationConfig(
+                image_preprocess="auto",
+                segment_max_side=50,
+                portrait_crop_ratio=1.2,
+            ),
+        )
+
+        boxes = transform_boxes_for_preprocessed_image(
+            [DetectionBox(bbox=(10, 40, 90, 120), label="bed", score=0.8)],
+            metadata,
+        )
+
+        self.assertEqual(len(boxes), 1)
+        self.assertEqual(boxes[0].bbox, (5, 5, 45, 45))
+
+    def test_excludes_people_and_room_planes_by_default(self):
+        image = Image.new("RGB", (20, 20), "white")
+        person_mask = np.zeros((20, 20), dtype=bool)
+        person_mask[2:10, 2:10] = True
+        floor_mask = np.zeros((20, 20), dtype=bool)
+        floor_mask[12:20, :] = True
+        bed_mask = np.zeros((20, 20), dtype=bool)
+        bed_mask[4:15, 6:18] = True
+
+        result = build_result_from_annotations(
+            image,
+            [
+                {"segmentation": person_mask, "label": "person", "score": 0.9},
+                {"segmentation": floor_mask, "label": "floor", "score": 0.9},
+                {"segmentation": bed_mask, "label": "bed", "score": 0.9},
+            ],
+            AutoSegmentationConfig(min_area_ratio=0.01),
+            mode="hybrid",
+        )
+
+        self.assertEqual([instance.label for instance in result.instances], ["bed"])
+        reasons = {entry["reason"] for entry in result.rejected}
+        self.assertIn("excluded_person", reasons)
+        self.assertIn("excluded_room_surface", reasons)
+        self.assertTrue(result.quality_passed)
+
+    def test_save_scene_input_can_write_debug_without_batch_masks(self):
+        image = Image.new("RGB", (10, 10), "white")
+        result = build_result_from_annotations(
+            image,
+            [],
+            AutoSegmentationConfig(min_area_ratio=0.01),
+            mode="hybrid",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            save_scene_input(result, tmp, write_batch_files=False)
+            names = {path.name for path in Path(tmp).iterdir()}
+            debug_names = {path.name for path in (Path(tmp) / "_auto_segmentation").iterdir()}
+
+        self.assertIn("scene.jpg", names)
+        self.assertIn("masked_scene.png", names)
+        self.assertNotIn("0.png", names)
+        self.assertNotIn("0_mask.png", names)
+        self.assertIn("manifest.json", debug_names)
+        self.assertIn("segmentation_overlay.png", debug_names)
+        self.assertIn("mask_contact_sheet.png", debug_names)
 
 
 if __name__ == "__main__":
