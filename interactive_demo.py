@@ -464,7 +464,7 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue", secondary_hue="indigo"))
                             positions_type = gr.Radio(
                                 label="Positions Type",
                                 choices=['last', 'avg'],
-                                value='last',
+                                value='avg',
                             )
                             simplify = gr.Slider(
                                 label="Simplify",

@@ -348,7 +348,7 @@ def segment(
             # It handles normalization and model-space transforms internally.
             masks, scores, _ = predictor.predict(
                 box=boxes_in,
-                multimask_output=False
+                multimask_output=True
             )
 
     # Normalize masks to numpy [N, H, W] boolean
@@ -357,8 +357,13 @@ def segment(
     else:
         masks_np = np.asarray(masks)
 
-    if masks_np.ndim == 4 and masks_np.shape[1] == 1:
-        masks_np = masks_np[:, 0]  # [N, 1, H, W] -> [N, H, W]
+    if masks_np.ndim == 4:
+        scores_np = np.asarray(scores)
+        if scores_np.ndim == 2 and masks_np.shape[:2] == scores_np.shape:
+            best_idx = np.argmax(scores_np, axis=1)
+            masks_np = masks_np[np.arange(masks_np.shape[0]), best_idx]
+        elif masks_np.shape[1] == 1:
+            masks_np = masks_np[:, 0]  # [N, 1, H, W] -> [N, H, W]
     masks_np = (masks_np > 0).astype(np.uint8)
 
     # Reuse refine_masks to optionally polygon-refine
